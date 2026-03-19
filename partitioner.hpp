@@ -23,6 +23,7 @@ public:
   void run();
   void saveResults(const std::string &outputPath);
   std::size_t numVertices() const;
+  void printStats() const;
 
 private:
   int num_cells;
@@ -30,10 +31,12 @@ private:
   std::vector<std::vector<Edge>> adj;
   std::vector<int> global_to_local;
 
-  void recursive_bisect(std::vector<int> &node_indices, int current_k);
+  void recursive_bisect(std::vector<int> &node_indices, int current_k,
+                        const double fraction);
   long long evaluate_cut(const std::vector<int> &node_indices,
                          const std::vector<int> &sources,
                          const std::vector<int> &sinks,
                          std::vector<int> &out_left,
-                         std::vector<int> &out_right, long long current_best_flow);
+                         std::vector<int> &out_right,
+                         long long current_best_flow);
 };

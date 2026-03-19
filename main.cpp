@@ -37,5 +37,9 @@ int main(int argc, char *argv[]) {
   p.run();
   p.saveResults(oFile);
 
+  if (showStats) {
+    p.printStats();
+  }
+
   return 0;
 }

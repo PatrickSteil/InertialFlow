@@ -102,7 +102,8 @@ long long Partitioner::evaluate_cut(const std::vector<int> &node_indices,
 }
 
 void Partitioner::recursive_bisect(std::vector<int> &node_indices,
-                                   int k_remaining) {
+                                   int k_remaining,
+                                   const double fraction = 0.25) {
   if (k_remaining <= 1 || node_indices.size() < 4)
     return;
 
@@ -120,7 +121,7 @@ void Partitioner::recursive_bisect(std::vector<int> &node_indices,
              (nodes[b].lon * p.dx + nodes[b].lat * p.dy);
     });
 
-    int q = sorted_indices.size() / 4;
+    int q = (int)(sorted_indices.size() * fraction);
     std::vector<int> src(sorted_indices.begin(), sorted_indices.begin() + q);
     std::vector<int> snk(sorted_indices.end() - q, sorted_indices.end());
 
@@ -168,4 +169,52 @@ void Partitioner::saveResults(const std::string &outputPath) {
   }
 
   outFile.close();
+}
+
+void Partitioner::printStats() const {
+  if (nodes.empty())
+    return;
+
+  std::vector<int> cell_sizes(num_cells, 0);
+  for (const auto &node : nodes) {
+    if (node.partition_id < num_cells) {
+      cell_sizes[node.partition_id]++;
+    }
+  }
+
+  long long total_cut_size = 0;
+  for (int u = 0; u < nodes.size(); ++u) {
+    for (const auto &edge : adj[u]) {
+      int v = edge.to;
+      if (nodes[u].partition_id != nodes[v].partition_id) {
+        total_cut_size++;
+      }
+    }
+  }
+
+  int min_size = std::numeric_limits<int>::max();
+  int max_size = 0;
+  double avg_size = static_cast<double>(nodes.size()) / num_cells;
+
+  for (int size : cell_sizes) {
+    if (size < min_size)
+      min_size = size;
+    if (size > max_size)
+      max_size = size;
+  }
+
+  double imbalance = (max_size / avg_size) - 1.0;
+
+  std::cout << "\n" << std::string(30, '=') << "\n";
+  std::cout << "   PARTITION STATISTICS\n";
+  std::cout << std::string(30, '=') << "\n";
+  std::cout << "Total Nodes:      " << nodes.size() << "\n";
+  std::cout << "Total Cells (k):  " << num_cells << "\n";
+  std::cout << "Total Cut Edges:  " << total_cut_size << "\n";
+  std::cout << "------------------------------\n";
+  std::cout << "Max Cell Size:    " << max_size << "\n";
+  std::cout << "Min Cell Size:    " << min_size << "\n";
+  std::cout << "Avg Cell Size:    " << avg_size << "\n";
+  printf("Imbalance:        %.2f%%\n", imbalance * 100.0);
+  std::cout << "------------------------------\n";
 }
