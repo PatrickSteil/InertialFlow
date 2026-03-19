@@ -1,0 +1,6 @@
+c 4 Nodes, 4 Edges
+p sp 4 4
+a 1 2 10
+a 2 4 5
+a 1 3 5
+a 3 4 10
