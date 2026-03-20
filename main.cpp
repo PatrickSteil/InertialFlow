@@ -13,6 +13,8 @@ void configure_parser(cli::Parser &parser) {
                             "Show statistics about the computed hub labels.");
   parser.set_optional<std::string>("o", "output_file", "dump.txt",
                                    "Write the partition to this file.");
+  parser.set_optional<double>("f", "fraction", 0.25,
+                              "Fraction of vertices to pick, must be < 0.5.");
 };
 
 int main(int argc, char *argv[]) {
@@ -25,6 +27,13 @@ int main(int argc, char *argv[]) {
   const int k = parser.get<int>("k");
   const bool showStats = parser.get<bool>("s");
   const std::string oFile = parser.get<std::string>("o");
+  const double fraction = parser.get<double>("f");
+
+  if (fraction <= 0.001 || fraction >= 0.49) {
+    std::cerr << "Given fraction should be between (0, 0.5), was " << fraction
+              << "!\n";
+    return -1;
+  }
 
   Partitioner p(k);
   p.loadGraph(gFile, cFile);
@@ -34,7 +43,7 @@ int main(int argc, char *argv[]) {
               << " many nodes **\n";
   }
 
-  p.run();
+  p.run(fraction);
   p.saveResults(oFile);
 
   if (showStats) {

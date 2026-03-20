@@ -144,13 +144,13 @@ void Partitioner::recursive_bisect(std::vector<int> &node_indices,
   recursive_bisect(best_right, k_remaining / 2);
 }
 
-void Partitioner::run() {
+void Partitioner::run(const double fraction = 0.25) {
   StatusLog log("Computing Partition");
   std::vector<int> all_indices(nodes.size());
   for (int i = 0; i < nodes.size(); ++i)
     all_indices[i] = i;
 
-  recursive_bisect(all_indices, num_cells);
+  recursive_bisect(all_indices, num_cells, fraction);
 }
 
 void Partitioner::saveResults(const std::string &outputPath) {
@@ -186,9 +186,7 @@ void Partitioner::printStats() const {
   for (int u = 0; u < nodes.size(); ++u) {
     for (const auto &edge : adj[u]) {
       int v = edge.to;
-      if (nodes[u].partition_id != nodes[v].partition_id) {
-        total_cut_size++;
-      }
+      total_cut_size += (nodes[u].partition_id != nodes[v].partition_id);
     }
   }
 
@@ -205,7 +203,7 @@ void Partitioner::printStats() const {
 
   double imbalance = (max_size / avg_size) - 1.0;
 
-  std::cout << "\n" << std::string(30, '=') << "\n";
+  std::cout << std::string(30, '=') << "\n";
   std::cout << "   PARTITION STATISTICS\n";
   std::cout << std::string(30, '=') << "\n";
   std::cout << "Total Nodes:      " << nodes.size() << "\n";

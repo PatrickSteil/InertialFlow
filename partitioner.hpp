@@ -20,7 +20,7 @@ public:
   Partitioner(int k) : num_cells(k) {}
 
   void loadGraph(const std::string &graphPath, const std::string &coordPath);
-  void run();
+  void run(const double fraction);
   void saveResults(const std::string &outputPath);
   std::size_t numVertices() const;
   void printStats() const;
