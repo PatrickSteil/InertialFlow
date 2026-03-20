@@ -36,7 +36,6 @@ private:
   std::vector<Node> nodes;
   std::vector<std::vector<Edge>> adj;
 
-  std::vector<int> buf_sorted;
   std::vector<int> buf_src;
   std::vector<int> buf_snk;
   std::vector<int> buf_L;

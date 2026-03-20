@@ -127,17 +127,21 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
   } projs[] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
 
   for (auto &p : projs) {
-    buf_sorted = node_indices;
+    auto n = node_indices.size();
+    int q = static_cast<int>(n * fraction);
 
-    std::sort(buf_sorted.begin(), buf_sorted.end(), [&](int a, int b) {
+    auto cmp = [&](int a, int b) {
       return (nodes[a].lon * p.dx + nodes[a].lat * p.dy) <
              (nodes[b].lon * p.dx + nodes[b].lat * p.dy);
-    });
+    };
 
-    int q = (int)(buf_sorted.size() * fraction);
+    std::nth_element(node_indices.begin(), node_indices.begin() + q,
+                     node_indices.end(), cmp);
+    std::nth_element(node_indices.begin() + q, node_indices.begin() + (n - q),
+                     node_indices.end(), cmp);
 
-    std::span<const int> src(buf_sorted.begin(), q);
-    std::span<const int> snk(buf_sorted.end() - q, q);
+    std::span<const int> src(node_indices.begin(), q);
+    std::span<const int> snk(node_indices.end() - q, q);
 
     buf_L.clear();
     buf_R.clear();
@@ -235,7 +239,6 @@ void Partitioner::printStats() const {
 }
 
 void Partitioner::init_buffers(size_t n) {
-  buf_sorted.reserve(n);
   buf_src.reserve(n);
   buf_snk.reserve(n);
   buf_L.reserve(n);
