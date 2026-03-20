@@ -3,6 +3,7 @@
 #include "generation_checker.hpp"
 
 #include <maxflow/graph.h> // From maxflow library
+#include <span>
 #include <string>
 #include <vector>
 
@@ -35,15 +36,21 @@ private:
   std::vector<Node> nodes;
   std::vector<std::vector<Edge>> adj;
 
+  std::vector<int> buf_sorted;
+  std::vector<int> buf_src;
+  std::vector<int> buf_snk;
+  std::vector<int> buf_L;
+  std::vector<int> buf_R;
+
   GenerationChecker<uint32_t> active;
   std::vector<int> global_to_local;
 
+  void init_buffers(size_t n);
   void recursive_bisect(MaxGraph &graph, std::vector<int> &node_indices,
                         int current_k, const double fraction);
   long long evaluate_cut(MaxGraph &graph, const std::vector<int> &node_indices,
-                         const std::vector<int> &sources,
-                         const std::vector<int> &sinks,
-                         std::vector<int> &out_left,
+                         std::span<const int> sources,
+                         std::span<const int> sinks, std::vector<int> &out_left,
                          std::vector<int> &out_right,
                          long long current_best_flow);
 };

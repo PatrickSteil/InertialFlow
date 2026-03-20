@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <span>
 
 std::size_t Partitioner::numVertices() const { return nodes.size(); }
 
@@ -46,13 +47,15 @@ MaxGraph Partitioner::loadGraph(const std::string &graphPath,
     }
   }
 
+  init_buffers(nodes.size());
+
   return MaxGraph{(int)nodes.size(), (int)numEdges};
 }
 
 long long Partitioner::evaluate_cut(MaxGraph &graph,
                                     const std::vector<int> &node_indices,
-                                    const std::vector<int> &sources,
-                                    const std::vector<int> &sinks,
+                                    std::span<const int> sources,
+                                    std::span<const int> sinks,
                                     std::vector<int> &out_left,
                                     std::vector<int> &out_right,
                                     long long current_best_flow) {
@@ -124,24 +127,28 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
   } projs[] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
 
   for (auto &p : projs) {
-    std::vector<int> sorted_indices = node_indices;
-    std::sort(sorted_indices.begin(), sorted_indices.end(), [&](int a, int b) {
+    buf_sorted = node_indices;
+
+    std::sort(buf_sorted.begin(), buf_sorted.end(), [&](int a, int b) {
       return (nodes[a].lon * p.dx + nodes[a].lat * p.dy) <
              (nodes[b].lon * p.dx + nodes[b].lat * p.dy);
     });
 
-    int q = (int)(sorted_indices.size() * fraction);
-    std::vector<int> src(sorted_indices.begin(), sorted_indices.begin() + q);
-    std::vector<int> snk(sorted_indices.end() - q, sorted_indices.end());
+    int q = (int)(buf_sorted.size() * fraction);
 
-    std::vector<int> L, R;
+    std::span<const int> src(buf_sorted.begin(), q);
+    std::span<const int> snk(buf_sorted.end() - q, q);
+
+    buf_L.clear();
+    buf_R.clear();
+
     long long flow =
-        evaluate_cut(graph, node_indices, src, snk, L, R, best_flow);
+        evaluate_cut(graph, node_indices, src, snk, buf_L, buf_R, best_flow);
 
     if (flow < best_flow) {
       best_flow = flow;
-      best_left = std::move(L);
-      best_right = std::move(R);
+      best_left = buf_L;
+      best_right = buf_R;
     }
   }
 
@@ -225,4 +232,12 @@ void Partitioner::printStats() const {
   std::cout << "Avg Cell Size:    " << avg_size << "\n";
   printf("Imbalance:        %.2f%%\n", imbalance * 100.0);
   std::cout << "------------------------------\n";
+}
+
+void Partitioner::init_buffers(size_t n) {
+  buf_sorted.reserve(n);
+  buf_src.reserve(n);
+  buf_snk.reserve(n);
+  buf_L.reserve(n);
+  buf_R.reserve(n);
 }
