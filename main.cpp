@@ -36,14 +36,14 @@ int main(int argc, char *argv[]) {
   }
 
   Partitioner p(k);
-  p.loadGraph(gFile, cFile);
+  MaxGraph graph = p.loadGraph(gFile, cFile);
 
   if (showStats) {
     std::cout << "** Loaded a graph with " << p.numVertices()
               << " many nodes **\n";
   }
 
-  p.run(fraction);
+  p.run(graph, fraction);
   p.saveResults(oFile);
 
   if (showStats) {

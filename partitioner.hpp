@@ -1,8 +1,12 @@
 #pragma once
 
+#include "generation_checker.hpp"
+
 #include <maxflow/graph.h> // From maxflow library
 #include <string>
 #include <vector>
+
+typedef maxflow::Graph<int, int, int> MaxGraph;
 
 struct Node {
   int id;
@@ -19,8 +23,9 @@ class Partitioner {
 public:
   Partitioner(int k) : num_cells(k) {}
 
-  void loadGraph(const std::string &graphPath, const std::string &coordPath);
-  void run(const double fraction);
+  MaxGraph loadGraph(const std::string &graphPath,
+                     const std::string &coordPath);
+  void run(MaxGraph &graph, const double fraction);
   void saveResults(const std::string &outputPath);
   std::size_t numVertices() const;
   void printStats() const;
@@ -29,11 +34,13 @@ private:
   int num_cells;
   std::vector<Node> nodes;
   std::vector<std::vector<Edge>> adj;
+
+  GenerationChecker<uint32_t> active;
   std::vector<int> global_to_local;
 
-  void recursive_bisect(std::vector<int> &node_indices, int current_k,
-                        const double fraction);
-  long long evaluate_cut(const std::vector<int> &node_indices,
+  void recursive_bisect(MaxGraph &graph, std::vector<int> &node_indices,
+                        int current_k, const double fraction);
+  long long evaluate_cut(MaxGraph &graph, const std::vector<int> &node_indices,
                          const std::vector<int> &sources,
                          const std::vector<int> &sinks,
                          std::vector<int> &out_left,

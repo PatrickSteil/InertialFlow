@@ -7,12 +7,10 @@
 #include <fstream>
 #include <iostream>
 
-typedef maxflow::Graph<int, int, int> MaxGraph;
-
 std::size_t Partitioner::numVertices() const { return nodes.size(); }
 
-void Partitioner::loadGraph(const std::string &graphPath,
-                            const std::string &coordPath) {
+MaxGraph Partitioner::loadGraph(const std::string &graphPath,
+                                const std::string &coordPath) {
   StatusLog log("Reading graph and coordinates");
   std::ifstream gFile(graphPath), cFile(coordPath);
   std::string line;
@@ -29,7 +27,11 @@ void Partitioner::loadGraph(const std::string &graphPath,
   }
 
   adj.resize(nodes.size());
-  global_to_local.assign(nodes.size(), -1);
+
+  active.resize(nodes.size());
+  global_to_local.resize(nodes.size());
+
+  std::size_t numEdges = 0;
 
   while (std::getline(gFile, line)) {
     if (line.empty() || line[0] != 'a')
@@ -39,45 +41,55 @@ void Partitioner::loadGraph(const std::string &graphPath,
       assert((size_t)(u - 1) < nodes.size());
       assert((size_t)(v - 1) < nodes.size());
       adj[u - 1].push_back({v - 1, 1});
+
+      ++numEdges;
     }
   }
+
+  return MaxGraph{(int)nodes.size(), (int)numEdges};
 }
 
-long long Partitioner::evaluate_cut(const std::vector<int> &node_indices,
+long long Partitioner::evaluate_cut(MaxGraph &graph,
+                                    const std::vector<int> &node_indices,
                                     const std::vector<int> &sources,
                                     const std::vector<int> &sinks,
                                     std::vector<int> &out_left,
                                     std::vector<int> &out_right,
                                     long long current_best_flow) {
-  MaxGraph g(node_indices.size(), node_indices.size() * 4);
-  g.add_node(node_indices.size());
+  graph.reset();
+  graph.add_node(node_indices.size());
+
+  active.reset();
 
   for (int i = 0; i < node_indices.size(); ++i) {
-    assert(node_indices[i] < global_to_local.size());
-    global_to_local[node_indices[i]] = i;
+    int g = node_indices[i];
+    active.mark(g);
+    global_to_local[g] = i;
   }
 
   const int INF = 1e9;
   for (int s : sources) {
-    g.add_tweights(global_to_local[s], INF, 0);
+    graph.add_tweights(global_to_local[s], INF, 0);
   }
   for (int t : sinks) {
-    g.add_tweights(global_to_local[t], 0, INF);
+    graph.add_tweights(global_to_local[t], 0, INF);
   }
 
   for (int u_global : node_indices) {
     int u_local = global_to_local[u_global];
+    assert(u_local < nodes.size());
+
     for (const auto &e : adj[u_global]) {
-      int v_local = global_to_local[e.to];
-      assert(u_local < nodes.size());
-      assert(v_local < nodes.size());
-      if (v_local != -1) {
-        g.add_edge(u_local, v_local, e.capacity, e.capacity);
+      if (active.isMarked(e.to)) {
+        int v_local = global_to_local[e.to];
+        assert(v_local < nodes.size());
+
+        graph.add_edge(u_local, v_local, e.capacity, e.capacity);
       }
     }
   }
 
-  long long flow = g.maxflow();
+  long long flow = graph.maxflow();
 
   if (flow < current_best_flow) {
     out_left.clear();
@@ -87,21 +99,18 @@ long long Partitioner::evaluate_cut(const std::vector<int> &node_indices,
 
     for (int i = 0; i < node_indices.size(); ++i) {
       int g_idx = node_indices[i];
-      if (g.what_segment(i) == MaxGraph::SOURCE) {
+      if (graph.what_segment(i) == MaxGraph::SOURCE) {
         out_left.push_back(g_idx);
       } else {
         out_right.push_back(g_idx);
       }
     }
   }
-
-  for (int i = 0; i < node_indices.size(); ++i) {
-    global_to_local[node_indices[i]] = -1;
-  }
   return flow;
 }
 
-void Partitioner::recursive_bisect(std::vector<int> &node_indices,
+void Partitioner::recursive_bisect(MaxGraph &graph,
+                                   std::vector<int> &node_indices,
                                    int k_remaining,
                                    const double fraction = 0.25) {
   if (k_remaining <= 1 || node_indices.size() < 4)
@@ -126,7 +135,8 @@ void Partitioner::recursive_bisect(std::vector<int> &node_indices,
     std::vector<int> snk(sorted_indices.end() - q, sorted_indices.end());
 
     std::vector<int> L, R;
-    long long flow = evaluate_cut(node_indices, src, snk, L, R, best_flow);
+    long long flow =
+        evaluate_cut(graph, node_indices, src, snk, L, R, best_flow);
 
     if (flow < best_flow) {
       best_flow = flow;
@@ -140,17 +150,17 @@ void Partitioner::recursive_bisect(std::vector<int> &node_indices,
     nodes[idx].partition_id |= (1 << bit);
   }
 
-  recursive_bisect(best_left, k_remaining / 2);
-  recursive_bisect(best_right, k_remaining / 2);
+  recursive_bisect(graph, best_left, k_remaining / 2);
+  recursive_bisect(graph, best_right, k_remaining / 2);
 }
 
-void Partitioner::run(const double fraction = 0.25) {
+void Partitioner::run(MaxGraph &graph, const double fraction = 0.25) {
   StatusLog log("Computing Partition");
   std::vector<int> all_indices(nodes.size());
   for (int i = 0; i < nodes.size(); ++i)
     all_indices[i] = i;
 
-  recursive_bisect(all_indices, num_cells, fraction);
+  recursive_bisect(graph, all_indices, num_cells, fraction);
 }
 
 void Partitioner::saveResults(const std::string &outputPath) {
