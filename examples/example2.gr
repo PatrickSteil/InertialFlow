@@ -1,20 +1,29 @@
-c 18 Nodes in two clusters
-p aux sp 18
-v 1 0 2
-v 2 1 2
-v 3 2 2
-v 4 0 1
-v 5 1 1
-v 6 2 1
-v 7 0 0
-v 8 1 0
-v 9 2 0
-v 10 5 0
-v 11 6 0
-v 12 7 0
-v 13 5 1
-v 14 6 1
-v 15 7 1
-v 16 5 2
-v 17 6 2
-v 18 7 2
+c 18 Nodes in two disconnected 3x3 grid clusters, 24 edges total
+c Cluster A: nodes 1-9 (x in [0,2], y in [0,2])
+c Cluster B: nodes 10-18 (x in [5,7], y in [0,2])
+c No edges connect the two clusters.
+p sp 18 24
+a 1 2 1
+a 2 3 1
+a 4 5 1
+a 5 6 1
+a 7 8 1
+a 8 9 1
+a 1 4 1
+a 4 7 1
+a 2 5 1
+a 5 8 1
+a 3 6 1
+a 6 9 1
+a 10 11 1
+a 11 12 1
+a 13 14 1
+a 14 15 1
+a 16 17 1
+a 17 18 1
+a 10 13 1
+a 13 16 1
+a 11 14 1
+a 14 17 1
+a 12 15 1
+a 15 18 1
