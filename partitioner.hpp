@@ -15,12 +15,29 @@ typedef maxflow::Graph<int, int, int> MaxGraph;
 struct Node {
   int id;
   double lat, lon;
+  // Vertex weight, used for balancing instead of raw vertex counts. Defaults
+  // to 1, which reproduces the old unweighted behavior. Populated either
+  // from an optional 4th column in the DIMACS coordinate file, or from the
+  // METIS graph file's own vertex weights when format == kMetis (see
+  // loadGraph).
+  long long weight = 1;
   int partition_id = 0;
 };
 
 struct Edge {
   int to;
   int capacity;
+};
+
+// Selects which format loadGraph() expects the graph file (the -g argument)
+// to be in. The coordinate file (-c) is always the DIMACS-style `v <id>
+// <lon> <lat> [weight]` format described in the README, regardless of
+// graphPath's format, since METIS graph files carry no geometric
+// coordinates.
+enum class GraphFormat {
+  kDimacs,  // `a <from> <to> <capacity>` lines, see README.
+  kMetis,   // Standard METIS graph format (header line `n m [fmt] [ncon]`
+            // followed by one adjacency line per vertex).
 };
 
 class Partitioner {
@@ -35,10 +52,24 @@ class Partitioner {
   // The loaded graph is cleaned before use: self loops are dropped, and
   // duplicate (parallel) edges between the same ordered pair of vertices
   // are merged into one, keeping the larger capacity.
-  MaxGraph loadGraph(const std::string& graphPath,
-                     const std::string& coordPath);
+  //
+  // Vertex weights: for format == kDimacs, an optional 4th column on each
+  // coordinate line (`v <id> <lon> <lat> <weight>`) sets that vertex's
+  // weight; if omitted, weight defaults to 1. For format == kMetis, vertex
+  // weights come from the METIS file itself when its header flags indicate
+  // they are present (if the METIS file declares multiple weight
+  // constraints, they are summed into one scalar weight); otherwise they
+  // fall back to the coordinate file's 4th column (or 1).
+  MaxGraph loadGraph(const std::string& graphPath, const std::string& coordPath,
+                     GraphFormat format = GraphFormat::kDimacs);
 
   // Throws std::invalid_argument if fraction is not in (0, 0.5).
+  //
+  // fraction is a fraction of total *vertex weight* (not vertex count): at
+  // each recursion step, sources/sinks are grown from the extremes of the
+  // current projection until their accumulated weight reaches
+  // fraction * (total weight of the current node set). With unit weights
+  // (the default) this reproduces the original count-based behavior.
   void run(MaxGraph& graph, const double fraction);
   void saveResults(const std::string& outputPath);
   std::size_t numVertices() const;
@@ -51,6 +82,26 @@ class Partitioner {
   std::size_t numDisconnected() const { return disconnected_count; }
 
  private:
+  // Parses the DIMACS-style coordinate file into `nodes`, defaulting every
+  // node's weight to 1 (overwritten by loadMetisEdges if the METIS file
+  // supplies its own vertex weights). Shared by both graph formats.
+  void loadCoordinates(const std::string& coordPath);
+
+  // Parses a DIMACS-style `a <from> <to> <capacity>` graph file into `adj`.
+  // Returns the number of edges kept (i.e. after dropping self loops, before
+  // clean_adjacency's dedup pass).
+  std::size_t loadDimacsEdges(const std::string& graphPath);
+
+  // Parses a METIS-format graph file into `adj`, overwriting `nodes[i].weight`
+  // in place when the file's header flags indicate vertex weights are
+  // present. METIS conventionally lists each undirected edge on both
+  // endpoints' lines, but files listing it only once (from either endpoint)
+  // are also accepted: edges are collected keyed by their unordered vertex
+  // pair, merging any duplicate occurrence by keeping the larger capacity,
+  // then emitted as exactly one directed entry per pair. Returns the number
+  // of (deduplicated) edges kept.
+  std::size_t loadMetisEdges(const std::string& graphPath);
+
   // recursive_bisect evaluates one candidate cut per projection direction
   // and keeps whichever has the smallest flow. There are exactly four
   // fixed directions (see recursive_bisect), so that's how many candidate

@@ -287,6 +287,142 @@ TEST_CASE("Partitioner: k=1 assigns every node to partition 0") {
   }
 }
 
+TEST_CASE("Partitioner: coordinate file weight column defaults to 1 when "
+         "omitted") {
+  std::string coordPath =
+      writeTempFile("p aux sp 2\nv 1 0 0\nv 2 1 0\n", ".co");
+  std::string graphPath = writeTempFile("p sp 2 1\na 1 2 5\n", ".gr");
+
+  Partitioner p(2);
+  p.loadGraph(graphPath, coordPath);
+
+  const auto &nodes = p.getNodes();
+  REQUIRE(nodes.size() == 2);
+  CHECK(nodes[0].weight == 1);
+  CHECK(nodes[1].weight == 1);
+}
+
+TEST_CASE("Partitioner: coordinate file 4th column sets vertex weight") {
+  std::string coordPath =
+      writeTempFile("p aux sp 2\nv 1 0 0 7\nv 2 1 0 3\n", ".co");
+  std::string graphPath = writeTempFile("p sp 2 1\na 1 2 5\n", ".gr");
+
+  Partitioner p(2);
+  p.loadGraph(graphPath, coordPath);
+
+  const auto &nodes = p.getNodes();
+  REQUIRE(nodes.size() == 2);
+  CHECK(nodes[0].weight == 7);
+  CHECK(nodes[1].weight == 3);
+}
+
+TEST_CASE("Partitioner: run() balances source/sink selection by weight, not "
+         "vertex count (regression test: a single very heavy vertex at one "
+         "end should be picked alone as the source, rather than grouped "
+         "with its neighbor purely because n * fraction said to take 2)") {
+  // A straight path of 8 nodes at x=0..7 (so the projection order is
+  // unambiguous), connected 0-1-2-...-7. Node 0 is given weight 1000; every
+  // other node keeps the default weight of 1.
+  //
+  // With the old count-based logic, fraction=0.25 on 8 nodes picks
+  // q = floor(8 * 0.25) = 2 source vertices unconditionally, i.e. {0, 1}.
+  // With weight-based logic, total weight is 1000 + 7 = 1007, so the
+  // target is floor(1007 * 0.25) = 251: node 0 alone (weight 1000) already
+  // clears that target, so the source is {0} only, leaving node 1 free to
+  // land on whichever side the max-flow cut prefers. Since nodes 1..7 form
+  // an unweighted path with no reason to cut anywhere but next to the
+  // pinned source, the min cut (and hence the partition boundary) should
+  // fall exactly between node 0 and node 1.
+  std::ostringstream coords, edges;
+  coords << "p aux sp 8\n";
+  coords << "v 1 0 0 1000\n";
+  for (int i = 1; i < 8; ++i) {
+    coords << "v " << (i + 1) << " " << i << " 0\n";
+  }
+  edges << "p sp 8 7\n";
+  for (int i = 1; i < 8; ++i) {
+    edges << "a " << i << " " << (i + 1) << " 1\n";
+  }
+
+  std::string coordPath = writeTempFile(coords.str(), ".co");
+  std::string graphPath = writeTempFile(edges.str(), ".gr");
+
+  Partitioner p(2);
+  MaxGraph g = p.loadGraph(graphPath, coordPath);
+  p.run(g, 0.25);
+
+  const auto &nodes = p.getNodes();
+  REQUIRE(nodes.size() == 8);
+  CHECK(nodes[0].partition_id != nodes[1].partition_id);
+  for (int i = 1; i < 8; ++i) {
+    CHECK(nodes[i].partition_id == nodes[1].partition_id);
+  }
+}
+
+TEST_CASE("Partitioner: loadGraph with GraphFormat::kMetis parses "
+         "unweighted METIS edges") {
+  // 4-cycle: 1-2, 2-3, 3-4, 4-1, each edge listed once per endpoint as
+  // METIS requires. fmt/ncon omitted (defaults: no weights).
+  std::string coordPath = writeTempFile(
+      "p aux sp 4\nv 1 0 0\nv 2 1 0\nv 3 1 1\nv 4 0 1\n", ".co");
+  std::string graphPath = writeTempFile(
+      "4 4\n"
+      "2 4\n"
+      "1 3\n"
+      "2 4\n"
+      "3 1\n",
+      ".graph");
+
+  Partitioner p(2);
+  p.loadGraph(graphPath, coordPath, GraphFormat::kMetis);
+
+  const auto &nodes = p.getNodes();
+  REQUIRE(nodes.size() == 4);
+  for (const auto &n : nodes) CHECK(n.weight == 1);
+
+  std::size_t totalEdges = 0;
+  for (const auto &edges : p.getAdjacency()) totalEdges += edges.size();
+  CHECK(totalEdges == 4);
+}
+
+TEST_CASE("Partitioner: loadGraph with GraphFormat::kMetis reads vertex "
+         "and edge weights when the header flags declare them") {
+  // fmt=11: vertex weights (2nd digit) and edge weights (3rd digit) present.
+  // ncon=1. Vertex 1 has weight 5, vertex 2 has weight 9; edge (1,2) has
+  // weight 42.
+  std::string coordPath =
+      writeTempFile("p aux sp 2\nv 1 0 0\nv 2 1 0\n", ".co");
+  std::string graphPath = writeTempFile(
+      "2 1 11 1\n"
+      "5 2 42\n"
+      "9 1 42\n",
+      ".graph");
+
+  Partitioner p(2);
+  p.loadGraph(graphPath, coordPath, GraphFormat::kMetis);
+
+  const auto &nodes = p.getNodes();
+  REQUIRE(nodes.size() == 2);
+  CHECK(nodes[0].weight == 5);
+  CHECK(nodes[1].weight == 9);
+
+  const auto &adj = p.getAdjacency();
+  REQUIRE(adj[0].size() == 1);
+  CHECK(adj[0][0].to == 1);
+  CHECK(adj[0][0].capacity == 42);
+}
+
+TEST_CASE("Partitioner: loadGraph with GraphFormat::kMetis throws when "
+         "header vertex count mismatches the coordinate file") {
+  std::string coordPath =
+      writeTempFile("p aux sp 2\nv 1 0 0\nv 2 1 0\n", ".co");
+  std::string graphPath = writeTempFile("3 1\n2\n1\n1\n", ".graph");
+
+  Partitioner p(2);
+  CHECK_THROWS_AS(p.loadGraph(graphPath, coordPath, GraphFormat::kMetis),
+                 std::runtime_error);
+}
+
 TEST_CASE("Partitioner: saveResults writes the documented file format") {
   auto [coordPath, graphPath] = makeClusteredGraph(2);
   Partitioner p(2);

@@ -15,7 +15,13 @@ void configure_parser(cli::Parser& parser) {
   parser.set_optional<std::string>("o", "output_file", "dump.txt",
                                    "Write the partition to this file.");
   parser.set_optional<double>("f", "fraction", 0.25,
-                              "Fraction of vertices to pick, must be < 0.5.");
+                              "Fraction of total vertex weight to pick for "
+                              "sources/sinks, must be < 0.5.");
+  parser.set_optional<bool>(
+      "m", "metis_format", false,
+      "Treat the input graph (-g) as a METIS-format file instead of "
+      "DIMACS. Coordinates are still read from -c; vertex/edge weights "
+      "embedded in the METIS file are used automatically.");
 };
 
 int main(int argc, char* argv[]) {
@@ -29,6 +35,7 @@ int main(int argc, char* argv[]) {
   const bool showStats = parser.get<bool>("s");
   const std::string oFile = parser.get<std::string>("o");
   const double fraction = parser.get<double>("f");
+  const bool metisFormat = parser.get<bool>("m");
 
   if (fraction <= 0.001 || fraction >= 0.49) {
     std::cerr << "Given fraction should be between (0, 0.5), was " << fraction
@@ -43,7 +50,9 @@ int main(int argc, char* argv[]) {
 
   try {
     Partitioner p(k);
-    MaxGraph graph = p.loadGraph(gFile, cFile);
+    MaxGraph graph = p.loadGraph(
+        gFile, cFile,
+        metisFormat ? GraphFormat::kMetis : GraphFormat::kDimacs);
 
     if (showStats) {
       std::cout << "** Loaded a graph with " << p.numVertices()

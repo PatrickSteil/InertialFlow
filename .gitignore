@@ -1,3 +1,5 @@
 build/
 build-debug/
 examples/USA*
+venv/
+dump.txt
