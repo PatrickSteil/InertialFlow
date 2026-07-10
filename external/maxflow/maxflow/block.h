@@ -291,6 +291,29 @@ public:
 		first_free = (block_item *) t;
 	}
 
+	/* Marks all items as free again, without releasing any of the
+	   underlying blocks back to the OS allocator. Equivalent to calling
+	   Delete() on every item ever New()'d from this DBlock, but done in
+	   one pass over the blocks themselves rather than by tracking
+	   individual items. Useful when a DBlock is used as scratch space
+	   that gets fully drained and refilled many times (e.g. once per
+	   maxflow() call on a reused Graph): capacity grows to whatever the
+	   largest call needed and is then just recycled, instead of being
+	   freed and malloc'd again on every call. */
+	void Reset()
+	{
+		first_free = NULL;
+		for (block *b = first; b; b = b -> next)
+		{
+			block_item *item = & ( b -> data[0] );
+			int t;
+			for (t = 0; t < block_size - 1; t++)
+				item[t].next_free = &item[t+1];
+			item[block_size-1].next_free = first_free;
+			first_free = &item[0];
+		}
+	}
+
 /***********************************************************************/
 
 private:

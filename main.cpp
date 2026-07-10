@@ -51,13 +51,7 @@ int main(int argc, char* argv[]) {
   try {
     Partitioner p(k);
     MaxGraph graph = p.loadGraph(
-        gFile, cFile,
-        metisFormat ? GraphFormat::kMetis : GraphFormat::kDimacs);
-
-    if (showStats) {
-      std::cout << "** Loaded a graph with " << p.numVertices()
-                << " many nodes **\n";
-    }
+        gFile, cFile, metisFormat ? GraphFormat::kMetis : GraphFormat::kDimacs);
 
     p.run(graph, fraction);
     p.saveResults(oFile);

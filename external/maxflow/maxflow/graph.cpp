@@ -25,6 +25,7 @@
 #include <string.h>
 #include "graph.h"
 
+
 namespace maxflow {
 
 #define TERMINAL ( (arc *) 1 )		/* to terminal */
@@ -71,10 +72,17 @@ template <typename captype, typename tcaptype, typename flowtype>
 	arc_last = arcs;
 	node_num = 0;
 
+	// Recycle nodeptr_block's already-malloc'd blocks (just rebuild its
+	// free list) instead of delete+recreate. reset() is typically called
+	// right before add_node()/add_edge()/maxflow() on this very same Graph
+	// object (e.g. once per candidate cut when a Graph is reused across a
+	// recursive partitioning run), so freeing this scratch allocator here
+	// only to malloc it right back inside the next maxflow() call wastes a
+	// malloc/free round trip every single call for no benefit: capacity
+	// simply settles at whatever the largest call so far needed.
 	if (nodeptr_block) 
 	{ 
-		delete nodeptr_block; 
-		nodeptr_block = NULL; 
+		nodeptr_block -> Reset();
 	}
 
 	maxflow_iteration = 0;
@@ -728,8 +736,24 @@ template <typename captype, typename tcaptype, typename flowtype>
 	}
 	// test_consistency();
 
-	if (!reuse_trees || (maxflow_iteration % 64) == 0)
+	if (!reuse_trees)
 	{
+		// This call is done and didn't ask to keep search trees around for
+		// next time, but the memory nodeptr_block has already malloc'd is
+		// still perfectly good scratch space for the *next* maxflow() call
+		// on this same Graph (Partitioner::evaluate_cut does exactly that:
+		// reset() + add_node()/add_edge() + maxflow(), over and over, on
+		// one Graph per worker thread). Reset() rebuilds the free list
+		// in-place instead of returning blocks to the OS allocator, so
+		// repeated calls stop doing new mallocs once capacity has grown to
+		// whatever the largest subproblem so far needed.
+		nodeptr_block -> Reset();
+	}
+	else if ((maxflow_iteration % 64) == 0)
+	{
+		// reuse_trees sessions can run for an unbounded number of
+		// incremental updates, so still trim back periodically here,
+		// same as before, rather than letting capacity grow forever.
 		delete nodeptr_block; 
 		nodeptr_block = NULL; 
 	}

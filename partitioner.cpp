@@ -19,12 +19,38 @@ Partitioner::Partitioner(int k) : num_cells(k) {
     throw std::invalid_argument("Number of cells k must be >= 1, was " +
                                 std::to_string(k));
   }
+  start_pool();
+}
+
+Partitioner::~Partitioner() { stop_pool(); }
+
+void Partitioner::start_pool() {
+  for (int p = 0; p < kNumProjections; ++p) {
+    workers[p] = std::thread([this, p]() { worker_loop(p); });
+  }
+}
+
+void Partitioner::stop_pool() {
+  pool_stop = true;
+  start_barrier.arrive_and_wait();
+  for (auto& t : workers) {
+    if (t.joinable()) t.join();
+  }
+}
+
+void Partitioner::worker_loop(int p) {
+  while (true) {
+    start_barrier.arrive_and_wait();
+    if (pool_stop) return;
+    run_projection(p);
+    done_barrier.arrive_and_wait();
+  }
 }
 
 std::size_t Partitioner::numVertices() const { return nodes.size(); }
 
-MaxGraph Partitioner::loadGraph(const std::string &graphPath,
-                                const std::string &coordPath,
+MaxGraph Partitioner::loadGraph(const std::string& graphPath,
+                                const std::string& coordPath,
                                 GraphFormat format) {
   StatusLog log("Reading graph and coordinates");
 
@@ -43,18 +69,13 @@ MaxGraph Partitioner::loadGraph(const std::string &graphPath,
   }
 
   filter_disconnected();
-  if (disconnected_count > 0) {
-    std::cout << "Found " << disconnected_count
-              << " disconnected vertex(es) (no incident edges); assigned "
-                 "to cell 0 and excluded from balancing\n";
-  }
-
+  build_csr();
   init_buffers(nodes.size(), numEdges);
 
   return MaxGraph{(int)nodes.size(), (int)numEdges};
 }
 
-void Partitioner::loadCoordinates(const std::string &coordPath) {
+void Partitioner::loadCoordinates(const std::string& coordPath) {
   std::ifstream cFile(coordPath);
   if (!cFile.is_open()) {
     throw std::runtime_error("Could not open coordinate file: " + coordPath);
@@ -62,13 +83,10 @@ void Partitioner::loadCoordinates(const std::string &coordPath) {
 
   std::string line;
   while (std::getline(cFile, line)) {
-    if (line.empty() || line[0] != 'v')
-      continue;
+    if (line.empty() || line[0] != 'v') continue;
     int id;
     double lat, lon;
     long long weight = 1;
-    // %lld is optional: sscanf simply stops matching (still returning 3)
-    // when the line has no 4th field, leaving `weight` at its default of 1.
     int matched =
         sscanf(line.c_str(), "v %d %lf %lf %lld", &id, &lon, &lat, &weight);
     if (matched >= 3) {
@@ -91,7 +109,7 @@ void Partitioner::loadCoordinates(const std::string &coordPath) {
   adj.resize(nodes.size());
 }
 
-std::size_t Partitioner::loadDimacsEdges(const std::string &graphPath) {
+std::size_t Partitioner::loadDimacsEdges(const std::string& graphPath) {
   std::ifstream gFile(graphPath);
   if (!gFile.is_open()) {
     throw std::runtime_error("Could not open graph file: " + graphPath);
@@ -102,13 +120,9 @@ std::size_t Partitioner::loadDimacsEdges(const std::string &graphPath) {
   std::size_t selfLoops = 0;
 
   while (std::getline(gFile, line)) {
-    if (line.empty())
-      continue;
+    if (line.empty()) continue;
 
     if (line[0] == 'n') {
-      // Vertex weight line: "n <id> <weight>". This is the standard DIMACS
-      // convention for vertex weights (as opposed to the 'a' edge lines'
-      // capacities), so it lives in the .gr file rather than the .co file.
       int id;
       long long weight;
       if (sscanf(line.c_str(), "n %d %lld", &id, &weight) == 2) {
@@ -124,8 +138,7 @@ std::size_t Partitioner::loadDimacsEdges(const std::string &graphPath) {
       continue;
     }
 
-    if (line[0] != 'a')
-      continue;
+    if (line[0] != 'a') continue;
     int u, v, cap;
     if (sscanf(line.c_str(), "a %d %d %d", &u, &v, &cap) == 3) {
       if (static_cast<std::size_t>(u - 1) >= nodes.size() ||
@@ -136,9 +149,6 @@ std::size_t Partitioner::loadDimacsEdges(const std::string &graphPath) {
                                  std::to_string(nodes.size()) + "]");
       }
 
-      // Self loops never affect a cut (a node is always on the same side
-      // as itself), so drop them here rather than carrying them through
-      // the rest of the pipeline.
       if (u == v) {
         ++selfLoops;
         continue;
@@ -157,23 +167,18 @@ std::size_t Partitioner::loadDimacsEdges(const std::string &graphPath) {
   return numEdges;
 }
 
-std::size_t Partitioner::loadMetisEdges(const std::string &graphPath) {
+std::size_t Partitioner::loadMetisEdges(const std::string& graphPath) {
   std::ifstream gFile(graphPath);
   if (!gFile.is_open()) {
     throw std::runtime_error("Could not open graph file: " + graphPath);
   }
 
-  // Skip comment lines (METIS uses '%') to find the header.
   std::string line;
   auto nextRealLine = [&]() -> bool {
     while (std::getline(gFile, line)) {
-      // Trim leading whitespace so a blank/whitespace-only line is
-      // correctly treated as skippable rather than a malformed header.
       std::size_t start = line.find_first_not_of(" \t\r");
-      if (start == std::string::npos)
-        continue;
-      if (line[start] == '%')
-        continue;
+      if (start == std::string::npos) continue;
+      if (line[start] == '%') continue;
       return true;
     }
     return false;
@@ -191,8 +196,7 @@ std::size_t Partitioner::loadMetisEdges(const std::string &graphPath) {
   }
   bool hasFmt = static_cast<bool>(header >> fmt);
   bool hasNcon = hasFmt && static_cast<bool>(header >> ncon);
-  if (hasFmt && !hasNcon)
-    ncon = 1;
+  if (hasFmt && !hasNcon) ncon = 1;
 
   if (static_cast<std::size_t>(declaredN) != nodes.size()) {
     throw std::runtime_error("METIS header vertex count (" +
@@ -204,8 +208,7 @@ std::size_t Partitioner::loadMetisEdges(const std::string &graphPath) {
   const bool hasVSizes = (fmt / 100) % 10 == 1;
   const bool hasVWeights = (fmt / 10) % 10 == 1;
   const bool hasEdgeWeights = fmt % 10 == 1;
-  if (ncon < 1)
-    ncon = 1;
+  if (ncon < 1) ncon = 1;
 
   std::size_t selfLoops = 0;
 
@@ -292,7 +295,7 @@ std::size_t Partitioner::loadMetisEdges(const std::string &graphPath) {
     std::cout << "Dropped " << selfLoops << " self-loop(s) from graph file\n";
   }
 
-  for (const auto &[key, cap] : edgeCapByPair) {
+  for (const auto& [key, cap] : edgeCapByPair) {
     int lo = static_cast<int>(key >> 32);
     int hi = static_cast<int>(key & 0xffffffffu);
     adj[lo].push_back({hi, cap});
@@ -304,18 +307,15 @@ std::size_t Partitioner::loadMetisEdges(const std::string &graphPath) {
 std::size_t Partitioner::clean_adjacency() {
   std::size_t duplicates = 0;
 
-  for (auto &edges : adj) {
-    if (edges.size() < 2)
-      continue;
+  for (auto& edges : adj) {
+    if (edges.size() < 2) continue;
 
     std::sort(edges.begin(), edges.end(),
-              [](const Edge &a, const Edge &b) { return a.to < b.to; });
+              [](const Edge& a, const Edge& b) { return a.to < b.to; });
 
     std::size_t write = 0;
     for (std::size_t read = 0; read < edges.size(); ++read) {
       if (write > 0 && edges[write - 1].to == edges[read].to) {
-        // Same (u, v) pair seen again: merge by keeping the larger
-        // capacity rather than silently dropping information.
         edges[write - 1].capacity =
             std::max(edges[write - 1].capacity, edges[read].capacity);
         ++duplicates;
@@ -333,9 +333,8 @@ void Partitioner::filter_disconnected() {
   std::vector<char> has_edge(nodes.size(), 0);
 
   for (std::size_t u = 0; u < adj.size(); ++u) {
-    if (!adj[u].empty())
-      has_edge[u] = 1;
-    for (const auto &e : adj[u]) {
+    if (!adj[u].empty()) has_edge[u] = 1;
+    for (const auto& e : adj[u]) {
       has_edge[e.to] = 1;
     }
   }
@@ -354,11 +353,26 @@ void Partitioner::filter_disconnected() {
   }
 }
 
+void Partitioner::build_csr() {
+  adj_offset.assign(nodes.size() + 1, 0);
+  std::size_t total = 0;
+  for (std::size_t u = 0; u < nodes.size(); ++u) {
+    adj_offset[u] = static_cast<int>(total);
+    total += adj[u].size();
+  }
+  adj_offset[nodes.size()] = static_cast<int>(total);
+
+  adj_edges.resize(total);
+  for (std::size_t u = 0; u < nodes.size(); ++u) {
+    std::copy(adj[u].begin(), adj[u].end(), adj_edges.begin() + adj_offset[u]);
+  }
+}
+
 long long Partitioner::evaluate_cut(
-    MaxGraph &graph, GenerationChecker<uint32_t> &active,
-    std::vector<int> &global_to_local, const std::vector<int> &node_indices,
+    MaxGraph& graph, GenerationChecker<uint32_t>& active,
+    std::vector<int>& global_to_local, const std::vector<int>& node_indices,
     std::span<const int> sources, std::span<const int> sinks,
-    std::vector<int> &out_left, std::vector<int> &out_right,
+    std::vector<int>& out_left, std::vector<int>& out_right,
     long long current_best_flow) {
   graph.reset();
   graph.add_node(node_indices.size());
@@ -382,7 +396,8 @@ long long Partitioner::evaluate_cut(
   for (int u_global : node_indices) {
     int u_local = global_to_local[u_global];
 
-    for (const auto &e : adj[u_global]) {
+    for (int ei = adj_offset[u_global]; ei < adj_offset[u_global + 1]; ++ei) {
+      const Edge& e = adj_edges[ei];
       if (active.isMarked(e.to)) {
         int v_local = global_to_local[e.to];
         graph.add_edge(u_local, v_local, e.capacity, e.capacity);
@@ -410,8 +425,8 @@ long long Partitioner::evaluate_cut(
   return flow;
 }
 
-void Partitioner::recursive_bisect(MaxGraph &graph,
-                                   std::vector<int> &node_indices, int lo,
+void Partitioner::recursive_bisect(MaxGraph& graph,
+                                   std::vector<int>& node_indices, int lo,
                                    int hi, const double fraction) {
   const int k_remaining = hi - lo;
 
@@ -428,19 +443,13 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
     return;
   }
 
-  struct {
-    double dx, dy;
-  } projs[] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
-
-  const auto n = node_indices.size();
-
-  // One candidate cut per projection direction, evaluated concurrently.
-  // Each projection needs its own copy of node_indices (nth_element
-  // reorders in place) and its own MaxGraph + scratch space (see
-  // FlowWorkspace) since the maxflow library's Graph is not safe to share
-  // across threads. Slot 0 reuses the caller-supplied graph; slots 1..N-1
-  // use the Partitioner-owned graphs allocated in init_buffers().
-  std::array<MaxGraph *, kNumProjections> graphs = {
+  // One candidate cut per projection direction, evaluated concurrently by
+  // the persistent worker pool (see run_projection). Each worker needs its
+  // own MaxGraph + scratch space (see FlowWorkspace) since the maxflow
+  // library's Graph is not safe to share across threads. Slot 0 reuses the
+  // caller-supplied graph; slots 1..N-1 use the Partitioner-owned graphs
+  // allocated in init_buffers().
+  std::array<MaxGraph*, kNumProjections> graphs = {
       &graph, flow_workspaces[1].owned_graph.get(),
       flow_workspaces[2].owned_graph.get(),
       flow_workspaces[3].owned_graph.get()};
@@ -453,71 +462,26 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
   // weight target rather than a vertex-count target. Same across all
   // projections (order-independent sum), so computed once here.
   long long total_weight = 0;
-  for (int idx : node_indices)
-    total_weight += nodes[idx].weight;
+  for (int idx : node_indices) total_weight += nodes[idx].weight;
   const long long target_weight =
       static_cast<long long>(total_weight * fraction);
 
-  std::vector<std::thread> threads;
-  threads.reserve(kNumProjections);
+  // Dispatch one round to the persistent worker pool (see the "Persistent
+  // worker pool" comment in partitioner.hpp) instead of spawning and
+  // joining kNumProjections std::threads here. round_data is only safe to
+  // write at this point because every worker is currently parked at
+  // start_barrier from the end of the *previous* round (or pool startup,
+  // for the very first round); arrive_and_wait() below is what lets them
+  // see it.
+  round_data.node_indices = &node_indices;
+  round_data.target_weight = target_weight;
+  round_data.graphs = &graphs;
+  round_data.flows = &flows;
+  round_data.lefts = &lefts;
+  round_data.rights = &rights;
 
-  for (int p = 0; p < kNumProjections; ++p) {
-    threads.emplace_back([&, p]() {
-      const auto &proj = projs[p];
-      auto cmp = [&](int a, int b) {
-        return (nodes[a].lon * proj.dx + nodes[a].lat * proj.dy) <
-               (nodes[b].lon * proj.dx + nodes[b].lat * proj.dy);
-      };
-
-      // Private copy: sort must not mutate node_indices, which is shared by
-      // every projection's thread. A full sort (rather than the previous
-      // nth_element) is needed because the source/sink cutoffs are now
-      // found by walking a weight prefix sum, which requires the elements
-      // in between to be in order too, not just partitioned around a rank.
-      std::vector<int> local_indices = node_indices;
-      std::sort(local_indices.begin(), local_indices.end(), cmp);
-
-      // Two-pointer weight-based selection: grow the source from the low
-      // end and the sink from the high end until each accumulates at least
-      // target_weight of vertex weight, without letting the two sides
-      // overlap (the sink walk stops at whatever the source walk already
-      // claimed). With unit weights (the default) this selects the same
-      // counts as the old n * fraction count-based logic.
-      std::size_t lo = 0;
-      long long lo_weight = 0;
-      while (lo < n && lo_weight < target_weight) {
-        lo_weight += nodes[local_indices[lo]].weight;
-        ++lo;
-      }
-
-      std::size_t hi = n;
-      std::size_t sink_count = 0;
-      long long hi_weight = 0;
-      while (hi > lo && hi_weight < target_weight) {
-        --hi;
-        hi_weight += nodes[local_indices[hi]].weight;
-        ++sink_count;
-      }
-
-      if (lo < 1 || sink_count < 1) {
-        // Too little weight (or too few vertices) to pick a non-empty
-        // source/sink set for this fraction; skip this projection rather
-        // than evaluating a degenerate (empty source or sink) cut.
-        return;
-      }
-
-      std::span<const int> src(local_indices.data(), lo);
-      std::span<const int> snk(local_indices.data() + hi, sink_count);
-
-      flows[p] = evaluate_cut(*graphs[p], flow_workspaces[p].active,
-                              flow_workspaces[p].global_to_local, local_indices,
-                              src, snk, lefts[p], rights[p],
-                              std::numeric_limits<long long>::max());
-    });
-  }
-
-  for (auto &t : threads)
-    t.join();
+  start_barrier.arrive_and_wait();
+  done_barrier.arrive_and_wait();
 
   long long best_flow = std::numeric_limits<long long>::max();
   int best_p = -1;
@@ -537,8 +501,8 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
     return;
   }
 
-  std::vector<int> &best_left = lefts[best_p];
-  std::vector<int> &best_right = rights[best_p];
+  std::vector<int>& best_left = lefts[best_p];
+  std::vector<int>& best_right = rights[best_p];
 
   // Split the id range proportionally to how many cells each side should
   // get, rather than assuming an even power-of-two split.
@@ -548,7 +512,59 @@ void Partitioner::recursive_bisect(MaxGraph &graph,
   recursive_bisect(graph, best_right, mid, hi, fraction);
 }
 
-void Partitioner::run(MaxGraph &graph, const double fraction) {
+void Partitioner::run_projection(int p) {
+  const std::vector<int>& node_indices = *round_data.node_indices;
+  const long long target_weight = round_data.target_weight;
+  auto& graphs = *round_data.graphs;
+  auto& flows = *round_data.flows;
+  auto& lefts = *round_data.lefts;
+  auto& rights = *round_data.rights;
+
+  struct {
+    double dx, dy;
+  } projs[] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
+  const auto& proj = projs[p];
+  const auto n = node_indices.size();
+
+  auto cmp = [&](int a, int b) {
+    return (nodes[a].lon * proj.dx + nodes[a].lat * proj.dy) <
+           (nodes[b].lon * proj.dx + nodes[b].lat * proj.dy);
+  };
+
+  std::vector<int>& local_indices = flow_workspaces[p].local_indices;
+  local_indices = node_indices;
+  std::sort(local_indices.begin(), local_indices.end(), cmp);
+
+  std::size_t lo = 0;
+  long long lo_weight = 0;
+  while (lo < n && lo_weight < target_weight) {
+    lo_weight += nodes[local_indices[lo]].weight;
+    ++lo;
+  }
+
+  std::size_t hi = n;
+  std::size_t sink_count = 0;
+  long long hi_weight = 0;
+  while (hi > lo && hi_weight < target_weight) {
+    --hi;
+    hi_weight += nodes[local_indices[hi]].weight;
+    ++sink_count;
+  }
+
+  if (lo < 1 || sink_count < 1) {
+    return;
+  }
+
+  std::span<const int> src(local_indices.data(), lo);
+  std::span<const int> snk(local_indices.data() + hi, sink_count);
+
+  flows[p] =
+      evaluate_cut(*graphs[p], flow_workspaces[p].active,
+                   flow_workspaces[p].global_to_local, local_indices, src, snk,
+                   lefts[p], rights[p], std::numeric_limits<long long>::max());
+}
+
+void Partitioner::run(MaxGraph& graph, const double fraction) {
   if (!(fraction > 0.0 && fraction < 0.5)) {
     throw std::invalid_argument(
         "Given fraction should be between (0, 0.5), was " +
@@ -556,15 +572,12 @@ void Partitioner::run(MaxGraph &graph, const double fraction) {
   }
 
   StatusLog log("Computing Partition");
-  // Only connected vertices participate in bisection/balancing; vertices
-  // with no incident edges were already assigned to cell 0 by
-  // filter_disconnected() in loadGraph().
   std::vector<int> all_indices = connected_indices;
 
   recursive_bisect(graph, all_indices, 0, num_cells, fraction);
 }
 
-void Partitioner::saveResults(const std::string &outputPath) {
+void Partitioner::saveResults(const std::string& outputPath) {
   StatusLog log("Saving partition to file " + outputPath);
   std::ofstream outFile(outputPath);
   if (!outFile.is_open()) {
@@ -575,7 +588,7 @@ void Partitioner::saveResults(const std::string &outputPath) {
 
   outFile << "N " << nodes.size() << "\n";
 
-  for (const auto &node : nodes) {
+  for (const auto& node : nodes) {
     outFile << node.id << " " << node.partition_id << "\n";
   }
 
@@ -583,13 +596,12 @@ void Partitioner::saveResults(const std::string &outputPath) {
 }
 
 void Partitioner::printStats() const {
-  if (nodes.empty())
-    return;
+  if (nodes.empty()) return;
 
   std::vector<int> cell_sizes(num_cells, 0);
   std::vector<long long> cell_weights(num_cells, 0);
   long long total_weight = 0;
-  for (const auto &node : nodes) {
+  for (const auto& node : nodes) {
     total_weight += node.weight;
     if (node.partition_id < num_cells) {
       cell_sizes[node.partition_id]++;
@@ -599,7 +611,7 @@ void Partitioner::printStats() const {
 
   long long total_cut_size = 0;
   for (std::size_t u = 0; u < nodes.size(); ++u) {
-    for (const auto &edge : adj[u]) {
+    for (const auto& edge : adj[u]) {
       int v = edge.to;
       total_cut_size += (nodes[u].partition_id != nodes[v].partition_id);
     }
@@ -610,10 +622,8 @@ void Partitioner::printStats() const {
   double avg_size = static_cast<double>(nodes.size()) / num_cells;
 
   for (int size : cell_sizes) {
-    if (size < min_size)
-      min_size = size;
-    if (size > max_size)
-      max_size = size;
+    if (size < min_size) min_size = size;
+    if (size > max_size) max_size = size;
   }
 
   double imbalance = (max_size / avg_size) - 1.0;
@@ -622,17 +632,12 @@ void Partitioner::printStats() const {
   long long max_weight = 0;
   double avg_weight = static_cast<double>(total_weight) / num_cells;
   for (long long w : cell_weights) {
-    if (w < min_weight)
-      min_weight = w;
-    if (w > max_weight)
-      max_weight = w;
+    if (w < min_weight) min_weight = w;
+    if (w > max_weight) max_weight = w;
   }
   double weight_imbalance =
       avg_weight > 0 ? (max_weight / avg_weight) - 1.0 : 0.0;
 
-  // Whether any vertex has a non-default weight; when every weight is 1 the
-  // weighted stats are identical to the count-based ones, so skip the extra
-  // (redundant) block in that common case.
   bool anyWeighted = (total_weight != static_cast<long long>(nodes.size()));
 
   std::cout << std::string(30, '=') << "\n";
@@ -661,12 +666,9 @@ void Partitioner::printStats() const {
 
 void Partitioner::init_buffers(size_t n, size_t numEdges) {
   for (int p = 0; p < kNumProjections; ++p) {
-    auto &ws = flow_workspaces[p];
+    auto& ws = flow_workspaces[p];
     ws.active.resize(n);
     ws.global_to_local.resize(n);
-    // Slot 0 uses the MaxGraph the caller passes into run()/
-    // recursive_bisect; slots 1..N-1 need their own, sized the same way
-    // the caller's was in loadGraph().
     if (p != 0) {
       ws.owned_graph = std::make_unique<MaxGraph>(static_cast<int>(n),
                                                   static_cast<int>(numEdges));
