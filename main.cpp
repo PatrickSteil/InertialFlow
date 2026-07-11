@@ -22,6 +22,10 @@ void configure_parser(cli::Parser& parser) {
       "Treat the input graph (-g) as a METIS-format file instead of "
       "DIMACS. Coordinates are still read from -c; vertex/edge weights "
       "embedded in the METIS file are used automatically.");
+  parser.set_optional<unsigned>(
+      "t", "threads", std::thread::hardware_concurrency(),
+      "Max number of worker threads to use for computing the partition. "
+      "Defaults to the number of hardware threads detected.");
 };
 
 int main(int argc, char* argv[]) {
@@ -36,6 +40,7 @@ int main(int argc, char* argv[]) {
   const std::string oFile = parser.get<std::string>("o");
   const double fraction = parser.get<double>("f");
   const bool metisFormat = parser.get<bool>("m");
+  const unsigned numThreads = parser.get<unsigned>("t");
 
   if (fraction <= 0.001 || fraction >= 0.49) {
     std::cerr << "Given fraction should be between (0, 0.5), was " << fraction
@@ -49,7 +54,7 @@ int main(int argc, char* argv[]) {
   }
 
   try {
-    Partitioner p(k);
+    Partitioner p(k, numThreads);
     MaxGraph graph = p.loadGraph(
         gFile, cFile, metisFormat ? GraphFormat::kMetis : GraphFormat::kDimacs);
 
