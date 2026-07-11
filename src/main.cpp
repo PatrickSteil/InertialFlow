@@ -26,6 +26,12 @@ void configure_parser(cli::Parser& parser) {
       "t", "threads", std::thread::hardware_concurrency(),
       "Max number of worker threads to use for computing the partition. "
       "Defaults to the number of hardware threads detected.");
+  parser.set_optional<bool>(
+      "l", "verbose_log", false,
+      "Log one CSV row per recursion step to stderr (std::clog), recording "
+      "the winning cut found at that step (node id range, vertex count, "
+      "projection angle, flow) and how long it took to compute. Redirect "
+      "stderr to a file to capture it, e.g. `... 2> steps.csv`.");
 };
 
 int main(int argc, char* argv[]) {
@@ -41,6 +47,7 @@ int main(int argc, char* argv[]) {
   const double fraction = parser.get<double>("f");
   const bool metisFormat = parser.get<bool>("m");
   const unsigned numThreads = parser.get<unsigned>("t");
+  const bool verboseLog = parser.get<bool>("l");
 
   if (fraction <= 0.001 || fraction >= 0.49) {
     std::cerr << "Given fraction should be between (0, 0.5), was " << fraction
@@ -54,7 +61,7 @@ int main(int argc, char* argv[]) {
   }
 
   try {
-    Partitioner p(k, numThreads);
+    Partitioner p(k, numThreads, verboseLog);
     MaxGraph graph = p.loadGraph(
         gFile, cFile, metisFormat ? GraphFormat::kMetis : GraphFormat::kDimacs);
 

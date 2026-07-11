@@ -27,10 +27,11 @@ int validate_k(int k) {
 unsigned clamp_threads(unsigned n) { return n < 1 ? 1 : n; }
 }  // namespace
 
-Partitioner::Partitioner(int k, unsigned requested_threads)
+Partitioner::Partitioner(int k, unsigned requested_threads, bool verbose_log)
     : num_cells(validate_k(k)),
       num_threads(clamp_threads(requested_threads)),
-      pool(num_threads) {}
+      pool(num_threads),
+      verbose_log_(verbose_log) {}
 
 Partitioner::~Partitioner() = default;
 
@@ -419,7 +420,7 @@ long long Partitioner::evaluate_cut(
 }
 
 void Partitioner::submit_bisect_task(std::vector<int> node_indices, int lo,
-                                     int hi, double fraction) {
+                                     int hi, double fraction, int depth) {
   const int k_remaining = hi - lo;
 
   // Base case: only one cell id left for this group of nodes (or too few
@@ -448,6 +449,8 @@ void Partitioner::submit_bisect_task(std::vector<int> node_indices, int lo,
   ctx->hi = hi;
   ctx->fraction = fraction;
   ctx->target_weight = static_cast<long long>(total_weight * fraction);
+  ctx->depth = depth;
+  ctx->start_time = std::chrono::steady_clock::now();
   ctx->remaining = kNumProjections;
   ctx->flows.fill(std::numeric_limits<long long>::max());
 
@@ -562,18 +565,40 @@ void Partitioner::run_projection_task(std::size_t worker_id,
     return;
   }
 
+  if (verbose_log_) {
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ctx->start_time)
+            .count();
+    const double best_angle_deg = best_p * (180.0 / kNumProjections);
+    log_step(ctx->depth, ctx->lo, ctx->hi, ctx->node_indices.size(),
+             best_angle_deg, best_flow, elapsed_ms);
+  }
+
   // Split the id range proportionally to how many cells each side should
   // get, rather than assuming an even power-of-two split.
   const int node_lo = ctx->lo;
   const int node_hi = ctx->hi;
   const int mid = node_lo + (node_hi - node_lo) / 2;
   const double fraction = ctx->fraction;
+  const int child_depth = ctx->depth + 1;
 
   // Moves, not copies: this is the last read of ctx->lefts/rights before
   // ctx itself is destroyed (once every shared_ptr reference -- the ones
   // captured by the 4 projection task lambdas -- goes out of scope).
-  submit_bisect_task(std::move(ctx->lefts[best_p]), node_lo, mid, fraction);
-  submit_bisect_task(std::move(ctx->rights[best_p]), mid, node_hi, fraction);
+  submit_bisect_task(std::move(ctx->lefts[best_p]), node_lo, mid, fraction,
+                     child_depth);
+  submit_bisect_task(std::move(ctx->rights[best_p]), mid, node_hi, fraction,
+                     child_depth);
+}
+
+void Partitioner::log_step(int depth, int lo, int hi,
+                           std::size_t num_vertices, double best_projection_deg,
+                           long long best_flow, double time_ms) {
+  std::lock_guard<std::mutex> lock(log_mutex_);
+  std::clog << depth << ',' << lo << ',' << hi << ',' << num_vertices << ','
+            << best_projection_deg << ',' << best_flow << ',' << time_ms
+            << '\n';
 }
 
 void Partitioner::run(MaxGraph& graph, const double fraction) {
@@ -586,6 +611,11 @@ void Partitioner::run(MaxGraph& graph, const double fraction) {
   StatusLog log("Computing Partition");
   external_graph = &graph;
 
+  if (verbose_log_) {
+    std::clog << "level,lo,hi,num_vertices,best_projection_deg,best_flow,"
+                 "time_ms\n";
+  }
+
   // Only connected vertices participate in bisection/balancing; vertices
   // with no incident edges were already assigned to cell 0 by
   // filter_disconnected() in loadGraph(). submit_bisect_task returns as
@@ -593,7 +623,7 @@ void Partitioner::run(MaxGraph& graph, const double fraction) {
   // wait_idle() blocks until every task the resulting task graph spawns --
   // arbitrarily deep, across every recursion level and every projection --
   // has actually finished.
-  submit_bisect_task(connected_indices, 0, num_cells, fraction);
+  submit_bisect_task(connected_indices, 0, num_cells, fraction, /*depth=*/0);
   pool.wait_idle();
 }
 

@@ -4,7 +4,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <thread>
@@ -51,8 +53,13 @@ class Partitioner {
   // parallel (see the "Persistent worker pool" section below); it defaults
   // to the hardware's reported concurrency (falling back to 1 if that's
   // unknown) and is clamped to at least 1 either way.
-  explicit Partitioner(int k, unsigned num_threads =
-                                  std::thread::hardware_concurrency());
+  //
+  // verbose_log, if true, makes run() emit one CSV row per recursion step
+  // to std::clog (see log_step() below) describing the winning cut found
+  // at that step and how long it took to compute.
+  explicit Partitioner(int k,
+                       unsigned num_threads = std::thread::hardware_concurrency(),
+                       bool verbose_log = false);
 
   // Stops and joins the persistent worker pool.
   ~Partitioner();
@@ -259,6 +266,16 @@ class Partitioner {
     int lo, hi;
     double fraction;
     long long target_weight;
+    // Recursion depth of this node (root is 0), only used for the
+    // verbose_log CSV's "level" column.
+    int depth;
+    // Set right before the kNumProjections projection tasks are submitted;
+    // used (when verbose_log_ is on) to compute this step's time_ms as
+    // wall-clock time from submission to the winning cut being picked,
+    // which -- since the projections run concurrently -- is close to the
+    // actual latency of this recursion step rather than the sum of all
+    // kNumProjections evaluations.
+    std::chrono::steady_clock::time_point start_time;
     // Starts at kNumProjections; each run_projection_task call decrements
     // it after writing its slot below. The task whose decrement brings it
     // to 0 is guaranteed (via the fetch_sub's acq_rel ordering) to see
@@ -280,10 +297,12 @@ class Partitioner {
 
   // Handles the base case directly (assigns partition id `lo` to every
   // vertex in node_indices), or otherwise builds a BisectContext and
-  // submits its 4 projection tasks to `pool`. Returns immediately in
-  // either case; does not block on the projections it just submitted.
+  // submits its kNumProjections projection tasks to `pool`. Returns
+  // immediately in either case; does not block on the projections it just
+  // submitted. depth is the recursion depth of this call (root is 0),
+  // threaded through purely for the verbose_log CSV's "level" column.
   void submit_bisect_task(std::vector<int> node_indices, int lo, int hi,
-                          double fraction);
+                          double fraction, int depth = 0);
 
   // Evaluates the candidate cut for projection p of ctx, exactly like the
   // old per-projection thread lambda did; if it's the last of the 4 to
@@ -304,4 +323,23 @@ class Partitioner {
                          std::span<const int> sinks, std::vector<int>& out_left,
                          std::vector<int>& out_right,
                          long long current_best_flow);
+
+  // ---- Detailed (per-step) CSV logging ----
+  //
+  // When enabled (constructor's verbose_log parameter), run() writes one
+  // CSV header line to std::clog, and run_projection_task() writes one
+  // data row per recursion step -- i.e. per node in the bisection tree,
+  // right after that node's winning projection is picked -- describing the
+  // cut that step chose and how long the step took to compute. Rows can
+  // arrive from any pool worker (whichever one happened to finish that
+  // step's last projection), so log_step() serializes writes with
+  // log_mutex_ to keep each row intact.
+  bool verbose_log_;
+  std::mutex log_mutex_;
+
+  // Writes one CSV data row: level,lo,hi,num_vertices,best_projection_deg,
+  // best_flow,time_ms. Only called when verbose_log_ is true.
+  void log_step(int depth, int lo, int hi, std::size_t num_vertices,
+               double best_projection_deg, long long best_flow,
+               double time_ms);
 };
