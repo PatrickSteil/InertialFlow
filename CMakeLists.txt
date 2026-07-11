@@ -10,8 +10,8 @@ find_package(Threads REQUIRED)
 include_directories(external/maxflow)
 add_subdirectory(external/maxflow)
 
-add_executable(partitioner main.cpp partitioner.cpp)
-target_include_directories(partitioner PUBLIC datastructures external)
+add_executable(partitioner src/main.cpp src/partitioner.cpp src/thread_pool.cpp)
+target_include_directories(partitioner PUBLIC include external)
 target_link_libraries(partitioner maxflow Threads::Threads)
 
 option(INERTIALFLOW_BUILD_TESTS "Build the InertialFlow unit tests" ON)
@@ -22,9 +22,10 @@ if(INERTIALFLOW_BUILD_TESTS)
     tests/test_main.cpp
     tests/test_generation_checker.cpp
     tests/test_partitioner.cpp
-    partitioner.cpp
+    src/partitioner.cpp
+    src/thread_pool.cpp
   )
-  target_include_directories(inertialflow_tests PUBLIC external tests ${CMAKE_SOURCE_DIR})
+  target_include_directories(inertialflow_tests PUBLIC include external tests)
   target_link_libraries(inertialflow_tests maxflow Threads::Threads)
 
   include(CTest)

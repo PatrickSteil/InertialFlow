@@ -2,10 +2,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numbers>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -14,38 +16,24 @@
 
 #include "status_log.hpp"
 
-Partitioner::Partitioner(int k) : num_cells(k) {
+namespace {
+int validate_k(int k) {
   if (k < 1) {
     throw std::invalid_argument("Number of cells k must be >= 1, was " +
                                 std::to_string(k));
   }
-  start_pool();
+  return k;
 }
+unsigned clamp_threads(unsigned n) { return n < 1 ? 1 : n; }
+}  // namespace
 
-Partitioner::~Partitioner() { stop_pool(); }
+Partitioner::Partitioner(int k, unsigned requested_threads, bool verbose_log)
+    : num_cells(validate_k(k)),
+      num_threads(clamp_threads(requested_threads)),
+      pool(num_threads),
+      verbose_log_(verbose_log) {}
 
-void Partitioner::start_pool() {
-  for (int p = 0; p < kNumProjections; ++p) {
-    workers[p] = std::thread([this, p]() { worker_loop(p); });
-  }
-}
-
-void Partitioner::stop_pool() {
-  pool_stop = true;
-  start_barrier.arrive_and_wait();
-  for (auto& t : workers) {
-    if (t.joinable()) t.join();
-  }
-}
-
-void Partitioner::worker_loop(int p) {
-  while (true) {
-    start_barrier.arrive_and_wait();
-    if (pool_stop) return;
-    run_projection(p);
-    done_barrier.arrive_and_wait();
-  }
-}
+Partitioner::~Partitioner() = default;
 
 std::size_t Partitioner::numVertices() const { return nodes.size(); }
 
@@ -62,11 +50,6 @@ MaxGraph Partitioner::loadGraph(const std::string& graphPath,
 
   std::size_t duplicates = clean_adjacency();
   numEdges -= duplicates;
-
-  if (duplicates > 0) {
-    std::cout << "Cleaned graph: removed " << duplicates
-              << " duplicate edge(s) (kept max capacity per pair)\n";
-  }
 
   filter_disconnected();
   build_csr();
@@ -87,6 +70,8 @@ void Partitioner::loadCoordinates(const std::string& coordPath) {
     int id;
     double lat, lon;
     long long weight = 1;
+    // %lld is optional: sscanf simply stops matching (still returning 3)
+    // when the line has no 4th field, leaving `weight` at its default of 1.
     int matched =
         sscanf(line.c_str(), "v %d %lf %lf %lld", &id, &lon, &lat, &weight);
     if (matched >= 3) {
@@ -123,6 +108,9 @@ std::size_t Partitioner::loadDimacsEdges(const std::string& graphPath) {
     if (line.empty()) continue;
 
     if (line[0] == 'n') {
+      // Vertex weight line: "n <id> <weight>". This is the standard DIMACS
+      // convention for vertex weights (as opposed to the 'a' edge lines'
+      // capacities), so it lives in the .gr file rather than the .co file.
       int id;
       long long weight;
       if (sscanf(line.c_str(), "n %d %lld", &id, &weight) == 2) {
@@ -149,6 +137,9 @@ std::size_t Partitioner::loadDimacsEdges(const std::string& graphPath) {
                                  std::to_string(nodes.size()) + "]");
       }
 
+      // Self loops never affect a cut (a node is always on the same side
+      // as itself), so drop them here rather than carrying them through
+      // the rest of the pipeline.
       if (u == v) {
         ++selfLoops;
         continue;
@@ -173,9 +164,12 @@ std::size_t Partitioner::loadMetisEdges(const std::string& graphPath) {
     throw std::runtime_error("Could not open graph file: " + graphPath);
   }
 
+  // Skip comment lines (METIS uses '%') to find the header.
   std::string line;
   auto nextRealLine = [&]() -> bool {
     while (std::getline(gFile, line)) {
+      // Trim leading whitespace so a blank/whitespace-only line is
+      // correctly treated as skippable rather than a malformed header.
       std::size_t start = line.find_first_not_of(" \t\r");
       if (start == std::string::npos) continue;
       if (line[start] == '%') continue;
@@ -425,9 +419,8 @@ long long Partitioner::evaluate_cut(
   return flow;
 }
 
-void Partitioner::recursive_bisect(MaxGraph& graph,
-                                   std::vector<int>& node_indices, int lo,
-                                   int hi, const double fraction) {
+void Partitioner::submit_bisect_task(std::vector<int> node_indices, int lo,
+                                     int hi, double fraction, int depth) {
   const int k_remaining = hi - lo;
 
   // Base case: only one cell id left for this group of nodes (or too few
@@ -443,125 +436,169 @@ void Partitioner::recursive_bisect(MaxGraph& graph,
     return;
   }
 
-  // One candidate cut per projection direction, evaluated concurrently by
-  // the persistent worker pool (see run_projection). Each worker needs its
-  // own MaxGraph + scratch space (see FlowWorkspace) since the maxflow
-  // library's Graph is not safe to share across threads. Slot 0 reuses the
-  // caller-supplied graph; slots 1..N-1 use the Partitioner-owned graphs
-  // allocated in init_buffers().
-  std::array<MaxGraph*, kNumProjections> graphs = {
-      &graph, flow_workspaces[1].owned_graph.get(),
-      flow_workspaces[2].owned_graph.get(),
-      flow_workspaces[3].owned_graph.get()};
-
-  std::array<long long, kNumProjections> flows;
-  flows.fill(std::numeric_limits<long long>::max());
-  std::array<std::vector<int>, kNumProjections> lefts, rights;
-
   // Total vertex weight of this node set, used to turn `fraction` into a
   // weight target rather than a vertex-count target. Same across all
-  // projections (order-independent sum), so computed once here.
+  // projections (order-independent sum), so computed once here rather than
+  // once per projection task.
   long long total_weight = 0;
   for (int idx : node_indices) total_weight += nodes[idx].weight;
-  const long long target_weight =
-      static_cast<long long>(total_weight * fraction);
 
-  // Dispatch one round to the persistent worker pool (see the "Persistent
-  // worker pool" comment in partitioner.hpp) instead of spawning and
-  // joining kNumProjections std::threads here. round_data is only safe to
-  // write at this point because every worker is currently parked at
-  // start_barrier from the end of the *previous* round (or pool startup,
-  // for the very first round); arrive_and_wait() below is what lets them
-  // see it.
-  round_data.node_indices = &node_indices;
-  round_data.target_weight = target_weight;
-  round_data.graphs = &graphs;
-  round_data.flows = &flows;
-  round_data.lefts = &lefts;
-  round_data.rights = &rights;
+  auto ctx = std::make_shared<BisectContext>();
+  ctx->node_indices = std::move(node_indices);
+  ctx->lo = lo;
+  ctx->hi = hi;
+  ctx->fraction = fraction;
+  ctx->target_weight = static_cast<long long>(total_weight * fraction);
+  ctx->depth = depth;
+  ctx->start_time = std::chrono::steady_clock::now();
+  ctx->remaining = kNumProjections;
+  ctx->flows.fill(std::numeric_limits<long long>::max());
 
-  start_barrier.arrive_and_wait();
-  done_barrier.arrive_and_wait();
+  // One candidate cut per projection direction, evaluated by up to
+  // kNumProjections pool workers concurrently (see run_projection_task).
+  // Handing these off to `pool` rather than calling run_projection_task
+  // directly is what lets this node's work interleave with unrelated
+  // nodes elsewhere in the recursion, instead of only ever running 4
+  // threads at a time no matter how many cores are available.
+  for (int p = 0; p < kNumProjections; ++p) {
+    pool.submit([this, ctx, p](std::size_t worker_id) {
+      run_projection_task(worker_id, ctx, p);
+    });
+  }
+}
+
+void Partitioner::run_projection_task(std::size_t worker_id,
+                                      std::shared_ptr<BisectContext> ctx,
+                                      int p) {
+  const std::vector<int>& node_indices = ctx->node_indices;
+  const long long target_weight = ctx->target_weight;
+  const auto n = node_indices.size();
+
+  // kNumProjections directions evenly spaced over [0, 180) degrees (see
+  // the kNumProjections doc comment in partitioner.hpp for why 180 rather
+  // than 360). p=0 reproduces the original (1, 0) direction exactly, since
+  // cos(0)=1, sin(0)=0.
+  const double angle = p * (std::numbers::pi / kNumProjections);
+  const double dx = std::cos(angle);
+  const double dy = std::sin(angle);
+
+  auto cmp = [&](int a, int b) {
+    return (nodes[a].lon * dx + nodes[a].lat * dy) <
+           (nodes[b].lon * dx + nodes[b].lat * dy);
+  };
+
+  // Reuse this worker's own scratch buffer across tasks (see
+  // FlowWorkspace::local_indices) instead of allocating a fresh copy of
+  // node_indices every time. Sort must not mutate ctx->node_indices
+  // itself, which is shared read-only by every projection task for this
+  // node. A full sort (rather than nth_element) is needed because the
+  // source/sink cutoffs are found by walking a weight prefix sum, which
+  // requires the elements in between to be in order too, not just
+  // partitioned around a rank.
+  FlowWorkspace& ws = flow_workspaces[worker_id];
+  std::vector<int>& local_indices = ws.local_indices;
+  local_indices = node_indices;
+  std::sort(local_indices.begin(), local_indices.end(), cmp);
+
+  // Two-pointer weight-based selection: grow the source from the low end
+  // and the sink from the high end until each accumulates at least
+  // target_weight of vertex weight, without letting the two sides overlap
+  // (the sink walk stops at whatever the source walk already claimed).
+  // With unit weights (the default) this selects the same counts as the
+  // old n * fraction count-based logic.
+  std::size_t src_end = 0;
+  long long lo_weight = 0;
+  while (src_end < n && lo_weight < target_weight) {
+    lo_weight += nodes[local_indices[src_end]].weight;
+    ++src_end;
+  }
+
+  std::size_t snk_start = n;
+  std::size_t sink_count = 0;
+  long long hi_weight = 0;
+  while (snk_start > src_end && hi_weight < target_weight) {
+    --snk_start;
+    hi_weight += nodes[local_indices[snk_start]].weight;
+    ++sink_count;
+  }
+
+  if (src_end >= 1 && sink_count >= 1) {
+    // Too little weight (or too few vertices) to pick a non-empty
+    // source/sink set for this fraction is the only way to land here with
+    // an empty side skipped; otherwise actually evaluate the cut. If
+    // skipped, ctx->flows[p] is left at the "skipped" sentinel value
+    // submit_bisect_task filled it with.
+    std::span<const int> src(local_indices.data(), src_end);
+    std::span<const int> snk(local_indices.data() + snk_start, sink_count);
+
+    MaxGraph& graph = (worker_id == 0) ? *external_graph : *ws.owned_graph;
+
+    ctx->flows[p] = evaluate_cut(
+        graph, ws.active, ws.global_to_local, local_indices, src, snk,
+        ctx->lefts[p], ctx->rights[p], std::numeric_limits<long long>::max());
+  }
+
+  // Whichever of the 4 projection tasks is the last to finish (the one
+  // whose decrement brings remaining to 0) is guaranteed by fetch_sub's
+  // acq_rel ordering to see every other task's writes above, so it's the
+  // one that picks the winning cut and recurses -- still inline, on
+  // whichever worker happens to be running it, no extra task hop needed.
+  if (ctx->remaining.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+    return;
+  }
 
   long long best_flow = std::numeric_limits<long long>::max();
   int best_p = -1;
-  for (int p = 0; p < kNumProjections; ++p) {
-    if (flows[p] < best_flow) {
-      best_flow = flows[p];
-      best_p = p;
+  for (int q = 0; q < kNumProjections; ++q) {
+    if (ctx->flows[q] < best_flow) {
+      best_flow = ctx->flows[q];
+      best_p = q;
     }
   }
 
   if (best_p < 0) {
     // Every projection was skipped (graph too small for this fraction);
     // fall back to the base case behavior.
-    for (int idx : node_indices) {
-      nodes[idx].partition_id = lo;
+    for (int idx : ctx->node_indices) {
+      nodes[idx].partition_id = ctx->lo;
     }
     return;
   }
 
-  std::vector<int>& best_left = lefts[best_p];
-  std::vector<int>& best_right = rights[best_p];
+  if (verbose_log_) {
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ctx->start_time)
+            .count();
+    const double best_angle_deg = best_p * (180.0 / kNumProjections);
+    log_step(ctx->depth, ctx->lo, ctx->hi, ctx->node_indices.size(),
+             best_angle_deg, best_flow, elapsed_ms);
+  }
 
   // Split the id range proportionally to how many cells each side should
   // get, rather than assuming an even power-of-two split.
-  const int mid = lo + k_remaining / 2;
+  const int node_lo = ctx->lo;
+  const int node_hi = ctx->hi;
+  const int mid = node_lo + (node_hi - node_lo) / 2;
+  const double fraction = ctx->fraction;
+  const int child_depth = ctx->depth + 1;
 
-  recursive_bisect(graph, best_left, lo, mid, fraction);
-  recursive_bisect(graph, best_right, mid, hi, fraction);
+  // Moves, not copies: this is the last read of ctx->lefts/rights before
+  // ctx itself is destroyed (once every shared_ptr reference -- the ones
+  // captured by the 4 projection task lambdas -- goes out of scope).
+  submit_bisect_task(std::move(ctx->lefts[best_p]), node_lo, mid, fraction,
+                     child_depth);
+  submit_bisect_task(std::move(ctx->rights[best_p]), mid, node_hi, fraction,
+                     child_depth);
 }
 
-void Partitioner::run_projection(int p) {
-  const std::vector<int>& node_indices = *round_data.node_indices;
-  const long long target_weight = round_data.target_weight;
-  auto& graphs = *round_data.graphs;
-  auto& flows = *round_data.flows;
-  auto& lefts = *round_data.lefts;
-  auto& rights = *round_data.rights;
-
-  struct {
-    double dx, dy;
-  } projs[] = {{1, 0}, {0, 1}, {1, 1}, {1, -1}};
-  const auto& proj = projs[p];
-  const auto n = node_indices.size();
-
-  auto cmp = [&](int a, int b) {
-    return (nodes[a].lon * proj.dx + nodes[a].lat * proj.dy) <
-           (nodes[b].lon * proj.dx + nodes[b].lat * proj.dy);
-  };
-
-  std::vector<int>& local_indices = flow_workspaces[p].local_indices;
-  local_indices = node_indices;
-  std::sort(local_indices.begin(), local_indices.end(), cmp);
-
-  std::size_t lo = 0;
-  long long lo_weight = 0;
-  while (lo < n && lo_weight < target_weight) {
-    lo_weight += nodes[local_indices[lo]].weight;
-    ++lo;
-  }
-
-  std::size_t hi = n;
-  std::size_t sink_count = 0;
-  long long hi_weight = 0;
-  while (hi > lo && hi_weight < target_weight) {
-    --hi;
-    hi_weight += nodes[local_indices[hi]].weight;
-    ++sink_count;
-  }
-
-  if (lo < 1 || sink_count < 1) {
-    return;
-  }
-
-  std::span<const int> src(local_indices.data(), lo);
-  std::span<const int> snk(local_indices.data() + hi, sink_count);
-
-  flows[p] =
-      evaluate_cut(*graphs[p], flow_workspaces[p].active,
-                   flow_workspaces[p].global_to_local, local_indices, src, snk,
-                   lefts[p], rights[p], std::numeric_limits<long long>::max());
+void Partitioner::log_step(int depth, int lo, int hi,
+                           std::size_t num_vertices, double best_projection_deg,
+                           long long best_flow, double time_ms) {
+  std::lock_guard<std::mutex> lock(log_mutex_);
+  std::clog << depth << ',' << lo << ',' << hi << ',' << num_vertices << ','
+            << best_projection_deg << ',' << best_flow << ',' << time_ms
+            << '\n';
 }
 
 void Partitioner::run(MaxGraph& graph, const double fraction) {
@@ -572,9 +609,22 @@ void Partitioner::run(MaxGraph& graph, const double fraction) {
   }
 
   StatusLog log("Computing Partition");
-  std::vector<int> all_indices = connected_indices;
+  external_graph = &graph;
 
-  recursive_bisect(graph, all_indices, 0, num_cells, fraction);
+  if (verbose_log_) {
+    std::clog << "level,lo,hi,num_vertices,best_projection_deg,best_flow,"
+                 "time_ms\n";
+  }
+
+  // Only connected vertices participate in bisection/balancing; vertices
+  // with no incident edges were already assigned to cell 0 by
+  // filter_disconnected() in loadGraph(). submit_bisect_task returns as
+  // soon as it has queued work rather than computing the partition itself;
+  // wait_idle() blocks until every task the resulting task graph spawns --
+  // arbitrarily deep, across every recursion level and every projection --
+  // has actually finished.
+  submit_bisect_task(connected_indices, 0, num_cells, fraction, /*depth=*/0);
+  pool.wait_idle();
 }
 
 void Partitioner::saveResults(const std::string& outputPath) {
@@ -638,6 +688,9 @@ void Partitioner::printStats() const {
   double weight_imbalance =
       avg_weight > 0 ? (max_weight / avg_weight) - 1.0 : 0.0;
 
+  // Whether any vertex has a non-default weight; when every weight is 1 the
+  // weighted stats are identical to the count-based ones, so skip the extra
+  // (redundant) block in that common case.
   bool anyWeighted = (total_weight != static_cast<long long>(nodes.size()));
 
   std::cout << std::string(30, '=') << "\n";
@@ -665,11 +718,15 @@ void Partitioner::printStats() const {
 }
 
 void Partitioner::init_buffers(size_t n, size_t numEdges) {
-  for (int p = 0; p < kNumProjections; ++p) {
-    auto& ws = flow_workspaces[p];
+  flow_workspaces.resize(num_threads);
+  for (unsigned w = 0; w < num_threads; ++w) {
+    auto& ws = flow_workspaces[w];
     ws.active.resize(n);
     ws.global_to_local.resize(n);
-    if (p != 0) {
+    // Worker 0 uses the MaxGraph the caller passes into run() (see
+    // external_graph); workers 1..N-1 need their own, sized the same way
+    // the caller's was in loadGraph().
+    if (w != 0) {
       ws.owned_graph = std::make_unique<MaxGraph>(static_cast<int>(n),
                                                   static_cast<int>(numEdges));
     }
